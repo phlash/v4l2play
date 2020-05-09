@@ -1,6 +1,7 @@
 #! /bin/sh
 # Start CamONLive stream as virtual camera for conferencing etc.
 HOST=localhost
+[ -z "$V4DEV" ] && V4DEV=/dev/video10
 [ -z "$1" ] && adb forward tcp:8080 tcp:8080
 [ -n "$1" ] && HOST=$1
 
