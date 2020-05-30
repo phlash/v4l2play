@@ -2,9 +2,11 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <time.h>
 #include <ctype.h>
 #include <libavformat/avformat.h>
 #include <SDL.h>
+#include <execinfo.h>
 
 int barf(char *msg, int rv) {
     int i;
@@ -23,22 +25,28 @@ int barf(char *msg, int rv) {
 }
 
 static int done = 0;
+void *oops[20];
 void trap(int sig) {
+    if (SIGSEGV==sig) {
+        int n=backtrace(oops, 20);
+        backtrace_symbols_fd(oops, n, 2);
+        _exit(1);
+    }
     done = 1;
 }
 
 static AVFormatContext *g_in_context;
-static AVCodecContext *g_dec0, *g_dec1;
-static AVFrame *g_frm0, *g_frm1;
+static AVCodecContext *g_dec[2];
+static AVFrame *g_frm[2];
 void nuke_allocs() {
-    if (g_frm0)
-        av_frame_free(&g_frm0);
-    if (g_frm1)
-        av_frame_free(&g_frm1);
-    if (g_dec0)
-        avcodec_free_context(&g_dec0);
-    if (g_dec1)
-        avcodec_free_context(&g_dec1);
+    if (g_frm[0])
+        av_frame_free(&g_frm[0]);
+    if (g_frm[1])
+        av_frame_free(&g_frm[1]);
+    if (g_dec[0])
+        avcodec_free_context(&g_dec[0]);
+    if (g_dec[1])
+        avcodec_free_context(&g_dec[1]);
     if (g_in_context)
         avformat_close_input(&g_in_context);
 }
@@ -46,23 +54,49 @@ void nuke_network() {
     avformat_network_deinit();
 }
 
-Uint32 map_format(enum AVPixelFormat pix_fmt) {
+Uint32 map_vformat(enum AVPixelFormat pix_fmt) {
     Uint32 rv = SDL_PIXELFORMAT_UNKNOWN;
-    switch(pix_fmt) {
+    switch (pix_fmt) {
     case AV_PIX_FMT_YUV420P:
         rv = SDL_PIXELFORMAT_YV12;  // guessing as there is f*ck all documentation..*sigh*
         break;
     default:
-        barf("unknown pixel format", 0);
+        barf("unknown pixel format", pix_fmt);
     }
     return rv;
 }
 
-void render_frame(SDL_Renderer *rnd, SDL_Texture *txt, AVFrame *frm) {
+SDL_AudioFormat map_aformat(enum AVSampleFormat aud_fmt) {
+    SDL_AudioFormat rv = 0;
+    switch (aud_fmt) {
+    case AV_SAMPLE_FMT_FLTP:
+        rv = AUDIO_F32SYS;
+        break;
+    default:
+        barf("unknown audio format", aud_fmt);
+    }
+    return rv;
+}
+
+static struct timespec g_last;
+static float g_vr;
+void render_video(SDL_Renderer *rnd, SDL_Texture *txt, AVFrame *frm) {
     Uint32 fmt;
     int acc, w, h;
     unsigned char *pixels;
     int pitch;
+    if (g_last.tv_sec!=0) {
+        // frame>0, delay to achieve specified video frame rate
+        long ns, nx;
+        ns = 1000000000L/(long)g_vr;
+        nx = g_last.tv_nsec+ns;
+        g_last.tv_nsec = nx%1000000000;
+        g_last.tv_sec = g_last.tv_sec+(nx/1000000000);
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &g_last, NULL);
+    } else {
+        // frame 0, grab entry time
+        clock_gettime(CLOCK_MONOTONIC, &g_last);
+    }
     if (SDL_QueryTexture(txt, &fmt, &acc, &w, &h)) {
         barf("reading texture properties", 0);
         return;
@@ -99,14 +133,47 @@ void render_frame(SDL_Renderer *rnd, SDL_Texture *txt, AVFrame *frm) {
     SDL_RenderPresent(rnd);
 }
 
-int decode_packet(SDL_Renderer *rnd, SDL_Texture *txt, AVCodecContext *ctx, AVFrame *frm, AVPacket *pkt) {
+void render_audio(SDL_AudioDeviceID adv, AVFrame *frm) {
+    // interleaving buffer
+    #define AUD_CHUNK_SIZE  1024
+    float intbuf[AUD_CHUNK_SIZE];
+    int n, i, c, nc = av_get_channel_layout_nb_channels(frm->channel_layout);
+    // check we have FLTP format incoming..
+    if (frm->format != AV_SAMPLE_FMT_FLTP) {
+        barf("unknown audio format", frm->format);
+        return;
+    }
+    // convert to interleaved format and queue for SDL in chunks
+    n = 0;
+    for (i=0; i<frm->nb_samples; ++i) {
+        for (c=0; c<nc; ++c) {
+            if (n>=AUD_CHUNK_SIZE) {
+                SDL_QueueAudio(adv, intbuf, n*sizeof(float));
+                n = 0;
+            }
+            intbuf[n++] = ((float*)frm->extended_data[c])[i];
+        }
+    }
+    if (n>0)
+        SDL_QueueAudio(adv, intbuf, n*sizeof(float));
+    // make sure we're running..
+    SDL_PauseAudioDevice(adv, 0);
+}
+
+int decode_packet(SDL_Renderer *rnd, SDL_Texture *txt, SDL_AudioDeviceID adv, AVPacket *pkt) {
     int rv, cnt;
-    if ((rv=avcodec_send_packet(ctx, pkt))>=0) {
+    if ((rv=avcodec_send_packet(g_dec[pkt->stream_index], pkt))>=0) {
         // loop to handle multi-frame packets
-        for (cnt=0; (rv=avcodec_receive_frame(ctx, frm))>=0; ++cnt) {
+        for (cnt=0;
+            (rv=avcodec_receive_frame(g_dec[pkt->stream_index],
+            g_frm[pkt->stream_index]))>=0;
+            ++cnt) {
             // write video frame to screen
-            if (AVMEDIA_TYPE_VIDEO==ctx->codec_type) {
-                render_frame(rnd, txt, frm);
+            if (AVMEDIA_TYPE_VIDEO==g_dec[pkt->stream_index]->codec_type) {
+                render_video(rnd, txt, g_frm[pkt->stream_index]);
+            // write audio frame to sound device
+            } else if(AVMEDIA_TYPE_AUDIO==g_dec[pkt->stream_index]->codec_type) {
+                render_audio(adv, g_frm[pkt->stream_index]);
             }
         }
     }
@@ -120,13 +187,16 @@ int decode_packet(SDL_Renderer *rnd, SDL_Texture *txt, AVCodecContext *ctx, AVFr
 int main(int argc, char **argv) {
     char *url = "rtsp://192.168.0.150:8080/video/h264";
     int rv = 0, pkts = 0;
-    int64_t total, s0, s1, us;
+    int64_t total, us, sc[2];
     AVCodec *c0, *c1;
-    AVCodecContext *vCtx, *aCtx;
+    int vidx, ridx;
     AVPacket *packet;
+    float r0, r1, vr;
     SDL_Window *win;
     SDL_Renderer *rnd;
     SDL_Texture *txt;
+    SDL_AudioDeviceID adv;
+    SDL_AudioSpec wnt, hve;
     char *msg;
     if (argc>1)
         url = argv[1];
@@ -149,8 +219,6 @@ int main(int argc, char **argv) {
     rv = avformat_find_stream_info(g_in_context, NULL);
     if (rv<0)
         return barf("reading stream info", rv);
-    // dump info
-    av_dump_format(g_in_context, 0, url, 0);
     if (g_in_context->nb_streams != 2)
         return barf("expecting 2 sub-streams", g_in_context->nb_streams);
     // find decoders
@@ -158,54 +226,68 @@ int main(int argc, char **argv) {
     c1 = avcodec_find_decoder(g_in_context->streams[1]->codecpar->codec_id);
     if (!c0 || !c1)
         return barf("unable to find codecs", 0);
+    // find video stream and save rate
+    vidx = AVMEDIA_TYPE_VIDEO==c0->type ? 0 : 1;
+    g_vr = (float)g_in_context->streams[vidx]->avg_frame_rate.num/(float)g_in_context->streams[vidx]->avg_frame_rate.den;
+    // dump info
     printf("stream#0: %s\nstream#1: %s\n", c0->name, c1->name);
+    printf("vidx: %d@%.1ffps\n", vidx, g_vr);
+    if (getenv("LIBAVPLAY_DUMP"))
+        av_dump_format(g_in_context, 0, url, 0);
     // allocate contexts
-    g_dec0 = avcodec_alloc_context3(c0);
-    g_dec1 = avcodec_alloc_context3(c1);
-    if (!g_dec0 || !g_dec1)
+    g_dec[0] = avcodec_alloc_context3(c0);
+    g_dec[1] = avcodec_alloc_context3(c1);
+    if (!g_dec[0] || !g_dec[1])
         return barf("unable to alloc codec contexts", 0);
-    vCtx = AVMEDIA_TYPE_VIDEO==g_dec0->codec_type ? g_dec0 : g_dec1;
-    aCtx = AVMEDIA_TYPE_VIDEO==g_dec0->codec_type ? g_dec1 : g_dec0;
     // transfer other paremters (if any)
-    if ((rv=avcodec_parameters_to_context(g_dec0, g_in_context->streams[0]->codecpar)) ||
-        (rv=avcodec_parameters_to_context(g_dec1, g_in_context->streams[1]->codecpar)))
+    if ((rv=avcodec_parameters_to_context(g_dec[0], g_in_context->streams[0]->codecpar)) ||
+        (rv=avcodec_parameters_to_context(g_dec[1], g_in_context->streams[1]->codecpar)))
         return barf("transfering codec parametesr", rv);
     // open contexts
-    if ((rv=avcodec_open2(g_dec0, c0, NULL))<0 ||
-        (rv=avcodec_open2(g_dec1, c1, NULL))<0)
+    if ((rv=avcodec_open2(g_dec[0], c0, NULL))<0 ||
+        (rv=avcodec_open2(g_dec[1], c1, NULL))<0)
         return barf("opening codec contexts", rv);
     // allocate decoded frames
-    g_frm0 = av_frame_alloc();
-    g_frm1 = av_frame_alloc();
-    if (!g_frm0 || !g_frm1)
+    g_frm[0] = av_frame_alloc();
+    g_frm[1] = av_frame_alloc();
+    if (!g_frm[0] || !g_frm[1])
         return barf("unable to alloc frames", 0);
-    // Create output window
+    // create output window
     win = SDL_CreateWindow("ooh look! an AV stream!",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        vCtx->width, vCtx->height, 0);
+        g_dec[vidx]->width, g_dec[vidx]->height, 0);
     rnd = SDL_CreateRenderer(win, -1, 0);
-    txt = SDL_CreateTexture(rnd, map_format(vCtx->pix_fmt),
+    txt = SDL_CreateTexture(rnd, map_vformat(g_dec[vidx]->pix_fmt),
         SDL_TEXTUREACCESS_STREAMING,
-        vCtx->width, vCtx->height);
+        g_dec[vidx]->width, g_dec[vidx]->height);
     if (!win || !rnd || !txt)
         return barf("creating output window", 0);
+    // create output audio
+    memset(&wnt, 0, sizeof(wnt));
+    memset(&hve, 0, sizeof(hve));
+    wnt.freq = g_dec[1-vidx]->sample_rate;
+    wnt.channels = g_dec[1-vidx]->channels;
+    wnt.samples = g_dec[1-vidx]->frame_size;
+    wnt.format = map_aformat(g_dec[1-vidx]->sample_fmt);
+    adv = SDL_OpenAudioDevice(NULL, 0, &wnt, &hve, 0);
+    if (!adv)
+        return barf("opening audio output", 0);
+    printf("aidx: %d@$%dHz %dch\n", 1-vidx, hve.freq, hve.channels);
     // grab frames (finally!)
     packet = av_packet_alloc();
     if (!packet)
         return barf("allocating input packet", rv);
     signal(SIGINT, trap);
-    total = s0 = s1 = us = 0;
+    signal(SIGSEGV, trap);
+    total = sc[0] = sc[1] = us = 0;
     msg = "reading packet";
     while ((rv=av_read_frame(g_in_context, packet))==0) {
         SDL_Event ev;
         // feed the decoder(s)
         total += packet->size;
-        if (0==packet->stream_index) {
-            rv = decode_packet(rnd, txt, g_dec0, g_frm0, packet);
-            s0 += rv;
-        } else if(1==packet->stream_index) {
-            rv = decode_packet(rnd, txt, g_dec1, g_frm1, packet);
-            s1 += rv;
+        if (packet->stream_index < 2) {
+            rv = decode_packet(rnd, txt, adv, packet);
+            sc[packet->stream_index] += rv;
         } else {
             ++us;
         }
@@ -214,7 +296,7 @@ int main(int argc, char **argv) {
             break;
         }
         msg = "reading packet";
-        printf("\rpackets:%04d, bytes:%ld, s0frms:%ld, s1frms:%ld, us:%ld   ", pkts, total, s0, s1, us);
+        printf("\rpackets:%04d, bytes:%ld, vfrms:%ld, afrms:%ld, us:%ld   ", pkts, total, sc[vidx], sc[1-vidx], us);
         fflush(stdout);
         ++pkts;
         if (done)

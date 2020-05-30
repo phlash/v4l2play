@@ -1,6 +1,7 @@
 #! /bin/sh
-# start metacity, then libavplay on provided display
+# start metacity, then specified application on specified display
 
 export DISPLAY=$1
+shift
 metacity &
-./libavplay rtsp://192.168.42.129:8080/video/h264
+$*
