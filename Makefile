@@ -24,7 +24,7 @@ v4l2play: v4l2play.c
 	$(CC) -o $@ $<
 
 libavplay: libavplay.c
-	$(CC) -g -o $@ $< $(SDL_FLG) $(LAV_FLG)
+	$(CC) -o $@ $< $(SDL_FLG) $(LAV_FLG)
 
 sdlprobe: sdlprobe.c
 	$(CC) -o $@ $< $(SDL_FLG)

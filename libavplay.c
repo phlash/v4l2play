@@ -30,7 +30,7 @@ void trap(int sig) {
     if (SIGSEGV==sig) {
         int n=backtrace(oops, 20);
         backtrace_symbols_fd(oops, n, 2);
-        _exit(1);
+        exit(1);
     }
     done = 1;
 }
